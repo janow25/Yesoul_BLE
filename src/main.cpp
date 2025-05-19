@@ -137,7 +137,7 @@ class DescriptorCallbacks : public NimBLEDescriptorCallbacks
 {
   void onWrite(NimBLEDescriptor *pDescriptor)
   {
-    std::string dscVal((char *)pDescriptor->getValue(), pDescriptor->getLength());
+    std::string dscVal = pDescriptor->getValue();
     Serial.print("Descriptor witten value:");
     Serial.println(dscVal.c_str());
   };
