@@ -281,15 +281,24 @@ void softDelay(unsigned long delayTime)
 // This section is for the Server that will broadcast the data as Cycling Power
 static DescriptorCallbacks dscCallbacks;
 static CharacteristicCallbacks chrCallbacks;
+// Cycling Power Service characteristics
 NimBLECharacteristic *CyclingPowerFeature = NULL;
 NimBLECharacteristic *CyclingPowerMeasurement = NULL;
 NimBLECharacteristic *CyclingPowerSensorLocation = NULL;
+
+// Cycling Speed and Cadence Service characteristics  
+NimBLECharacteristic *CSCFeature = NULL;
+NimBLECharacteristic *CSCMeasurement = NULL;
+NimBLECharacteristic *CSCSensorLocation = NULL;
+
 unsigned char bleBuffer[8];
+unsigned char cscBuffer[5];
 unsigned char slBuffer[1];
 unsigned char fBuffer[4];
+unsigned char cscFeatureBuffer[2];
 unsigned short revolutions = 0;
 unsigned short timestamp = 0;
-unsigned short flags = 0x20;
+unsigned short flags = 0x20; // Crank revolution data present flag
 byte sensorlocation = 0x0D;
 long lastNotify = 0;
 long lastRevolution = 0;
@@ -307,6 +316,7 @@ void setup()
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
+  // Cycling Power Service setup
   fBuffer[0] = 0x00;
   fBuffer[1] = 0x00;
   fBuffer[2] = 0x00;
@@ -314,14 +324,15 @@ void setup()
 
   slBuffer[0] = sensorlocation & 0xff;
 
-  NimBLEService *pDeadService = pServer->createService("1818");
-  CyclingPowerFeature = pDeadService->createCharacteristic(
+  // Create Cycling Power Service (0x1818)
+  NimBLEService *pPowerService = pServer->createService("1818");
+  CyclingPowerFeature = pPowerService->createCharacteristic(
       "2A65",
       NIMBLE_PROPERTY::READ);
-  CyclingPowerSensorLocation = pDeadService->createCharacteristic(
+  CyclingPowerSensorLocation = pPowerService->createCharacteristic(
       "2A5D",
       NIMBLE_PROPERTY::READ);
-  CyclingPowerMeasurement = pDeadService->createCharacteristic(
+  CyclingPowerMeasurement = pPowerService->createCharacteristic(
       "2A63",
       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
@@ -329,12 +340,35 @@ void setup()
   CyclingPowerSensorLocation->setValue(slBuffer, 1);
   CyclingPowerMeasurement->setValue(slBuffer, 1);
 
+  // Create Cycling Speed and Cadence Service (0x1816) for better Apple Watch compatibility
+  NimBLEService *pCSCService = pServer->createService("1816");
+  
+  // CSC Feature: bit 0 = Wheel Revolution Data Supported, bit 1 = Crank Revolution Data Supported
+  cscFeatureBuffer[0] = 0x02; // Only crank revolution data supported
+  cscFeatureBuffer[1] = 0x00;
+  
+  CSCFeature = pCSCService->createCharacteristic(
+      "2A5C",  // CSC Feature characteristic
+      NIMBLE_PROPERTY::READ);
+  CSCSensorLocation = pCSCService->createCharacteristic(
+      "2A5D",  // Sensor Location characteristic  
+      NIMBLE_PROPERTY::READ);
+  CSCMeasurement = pCSCService->createCharacteristic(
+      "2A5B",  // CSC Measurement characteristic
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+
+  CSCFeature->setValue(cscFeatureBuffer, 2);
+  CSCSensorLocation->setValue(slBuffer, 1);
+  CSCMeasurement->setValue(slBuffer, 1);
+
   /** Start the services when finished creating all Characteristics and Descriptors */
-  pDeadService->start();
+  pPowerService->start();
+  pCSCService->start();
 
   NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
   /** Add the services to the advertisment data **/
-  pAdvertising->addServiceUUID(pDeadService->getUUID());
+  pAdvertising->addServiceUUID(pPowerService->getUUID());
+  pAdvertising->addServiceUUID(pCSCService->getUUID());
   pAdvertising->setScanResponse(true);
   pAdvertising->start();
 
@@ -394,6 +428,7 @@ void loop()
   {
     if (pServer->getConnectedCount() > 0)
     {
+      // Cycling Power Measurement
       bleBuffer[0] = flags & 0xff;
       bleBuffer[1] = (flags >> 8) & 0xff;
       bleBuffer[2] = powerInstantaneous & 0xff;
@@ -404,7 +439,21 @@ void loop()
       bleBuffer[7] = (timestamp >> 8) & 0xff;
       CyclingPowerMeasurement->setValue(bleBuffer, 8);
       CyclingPowerMeasurement->notify();
+      
+      // CSC Measurement - send crank revolution data for cadence
+      // Flags: bit 1 = Crank Revolution Data Present
+      cscBuffer[0] = 0x02; // Crank Revolution Data Present flag
+      cscBuffer[1] = revolutions & 0xff;        // Cumulative Crank Revolutions (LSB)
+      cscBuffer[2] = (revolutions >> 8) & 0xff; // Cumulative Crank Revolutions (MSB)
+      cscBuffer[3] = timestamp & 0xff;          // Last Crank Event Time (LSB)
+      cscBuffer[4] = (timestamp >> 8) & 0xff;   // Last Crank Event Time (MSB)
+      CSCMeasurement->setValue(cscBuffer, 5);
+      CSCMeasurement->notify();
+      
       lastNotify = millis();
+      
+      Serial.printf("Sent - Power: %dW, Cadence: %dRPM, Revolutions: %d, Timestamp: %d\n", 
+                    powerInstantaneous, cadenceInstantaneous, revolutions, timestamp);
     }
   }
   if (pServer->getConnectedCount() == 0)
