@@ -1,5 +1,8 @@
 # Yesoul_BLE
 
+# Fork Reason
+This Fork removes the data correction as my bike does not need it and it allows cadence to be send to Apple Watch. Not Tested on Garmin Watches.
+
 # Summary
 This project uses an ESP32 board to receive data from a Yesoul S3 spin bike and rebroadcast it in a format that works with a Garmin Edge cycle computer or Garmin Watch that supports BLE sensors.
 
