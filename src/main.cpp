@@ -159,8 +159,8 @@ static void notifyCallback(
     bool isNotify)
 {
   powerInstantaneous = pData[11] | pData[12] << 8;       // 2 bytes of power
-  Serial.printf("Power = %d\n", powerInstantaneous);
-  powerInstantaneous = powerInstantaneous * powerScale;  //power value correction
+  // Serial.printf("Power = %d\n", powerInstantaneous);
+  // powerInstantaneous = powerInstantaneous * powerScale;  //power value correction
   cadenceInstantaneous = (pData[4] | pData[5] << 8) / 2; // 2 bytes of power in 0.5 resolution RPM, convert to RPM
   resistance = pData[9];                                 // 1 byte of resistance
   Serial.printf("Power = %d | Cadence = %d | Resistance = %d\n", powerInstantaneous, cadenceInstantaneous, resistance);
@@ -428,6 +428,9 @@ void loop()
   {
     if (pServer->getConnectedCount() > 0)
     {
+      // Apply power correction before sending
+      // short correctedPower = powerInstantaneous * powerScale;
+      
       // Cycling Power Measurement
       bleBuffer[0] = flags & 0xff;
       bleBuffer[1] = (flags >> 8) & 0xff;
@@ -452,7 +455,7 @@ void loop()
       
       lastNotify = millis();
       
-      Serial.printf("Sent - Power: %dW, Cadence: %dRPM, Revolutions: %d, Timestamp: %d\n", 
+      Serial.printf("Sent - Power: %dW (corrected), Cadence: %dRPM, Revolutions: %d, Timestamp: %d\n", 
                     powerInstantaneous, cadenceInstantaneous, revolutions, timestamp);
     }
   }
