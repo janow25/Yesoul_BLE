@@ -292,7 +292,7 @@ NimBLECharacteristic *CSCMeasurement = NULL;
 NimBLECharacteristic *CSCSensorLocation = NULL;
 
 unsigned char bleBuffer[8];
-unsigned char cscBuffer[5];
+unsigned char cscBuffer[11]; // Increased size for wheel + crank data
 unsigned char slBuffer[1];
 unsigned char fBuffer[4];
 unsigned char cscFeatureBuffer[2];
@@ -302,6 +302,14 @@ unsigned short flags = 0x20; // Crank revolution data present flag
 byte sensorlocation = 0x0D;
 long lastNotify = 0;
 long lastRevolution = 0;
+
+// Distance tracking variables
+unsigned long wheelRevolutions = 0;
+unsigned short wheelTimestamp = 0;
+float totalDistance = 0.0; // in meters
+float wheelCircumference = 2.096; // Standard road bike wheel circumference in meters (700x25c)
+long lastWheelRevolution = 0;
+float estimatedSpeed = 0.0; // km/h
 
 void setup()
 {
@@ -344,7 +352,7 @@ void setup()
   NimBLEService *pCSCService = pServer->createService("1816");
   
   // CSC Feature: bit 0 = Wheel Revolution Data Supported, bit 1 = Crank Revolution Data Supported
-  cscFeatureBuffer[0] = 0x02; // Only crank revolution data supported
+  cscFeatureBuffer[0] = 0x03; // Both wheel and crank revolution data supported
   cscFeatureBuffer[1] = 0x00;
   
   CSCFeature = pCSCService->createCharacteristic(
@@ -424,6 +432,30 @@ void loop()
     lastRevolution = millis();
   }
 
+  // Calculate distance from cadence (indoor cycling estimation)
+  // Estimate speed based on cadence and typical gear ratio for indoor cycling
+  if (cadenceInstantaneous > 0) {
+    // Rough estimation: cadence * gear ratio factor * wheel circumference
+    // For indoor cycling, we'll use a moderate gear ratio equivalent
+    float gearRatio = 2.5; // Typical indoor cycling gear ratio
+    estimatedSpeed = (cadenceInstantaneous * gearRatio * wheelCircumference * 60) / 1000; // km/h
+    
+    // Calculate wheel revolutions based on estimated speed
+    unsigned long currentTime = millis();
+    if (currentTime >= (lastWheelRevolution + 100)) { // Update every 100ms when moving
+      float revolutionsPerSecond = (estimatedSpeed * 1000) / (wheelCircumference * 3600); // rev/sec
+      float timeDeltaSeconds = (currentTime - lastWheelRevolution) / 1000.0;
+      float newRevolutions = revolutionsPerSecond * timeDeltaSeconds;
+      
+      if (newRevolutions >= 1.0) {
+        wheelRevolutions += (unsigned long)newRevolutions;
+        wheelTimestamp = (unsigned short)(((millis() * 1024) / 1000) % 65536);
+        totalDistance += newRevolutions * wheelCircumference;
+        lastWheelRevolution = currentTime;
+      }
+    }
+  }
+
   if (millis() - lastNotify >= 1000) // do this every second
   {
     if (pServer->getConnectedCount() > 0)
@@ -443,20 +475,31 @@ void loop()
       CyclingPowerMeasurement->setValue(bleBuffer, 8);
       CyclingPowerMeasurement->notify();
       
-      // CSC Measurement - send crank revolution data for cadence
-      // Flags: bit 1 = Crank Revolution Data Present
-      cscBuffer[0] = 0x02; // Crank Revolution Data Present flag
-      cscBuffer[1] = revolutions & 0xff;        // Cumulative Crank Revolutions (LSB)
-      cscBuffer[2] = (revolutions >> 8) & 0xff; // Cumulative Crank Revolutions (MSB)
-      cscBuffer[3] = timestamp & 0xff;          // Last Crank Event Time (LSB)
-      cscBuffer[4] = (timestamp >> 8) & 0xff;   // Last Crank Event Time (MSB)
-      CSCMeasurement->setValue(cscBuffer, 5);
+      // CSC Measurement - send both wheel and crank revolution data for distance and cadence
+      // Flags: bit 0 = Wheel Revolution Data Present, bit 1 = Crank Revolution Data Present
+      cscBuffer[0] = 0x03; // Both wheel and crank revolution data present
+      
+      // Wheel Revolution Data (for distance)
+      cscBuffer[1] = wheelRevolutions & 0xff;         // Cumulative Wheel Revolutions (LSB)
+      cscBuffer[2] = (wheelRevolutions >> 8) & 0xff;  // Cumulative Wheel Revolutions (byte 1)
+      cscBuffer[3] = (wheelRevolutions >> 16) & 0xff; // Cumulative Wheel Revolutions (byte 2)
+      cscBuffer[4] = (wheelRevolutions >> 24) & 0xff; // Cumulative Wheel Revolutions (MSB)
+      cscBuffer[5] = wheelTimestamp & 0xff;           // Last Wheel Event Time (LSB)
+      cscBuffer[6] = (wheelTimestamp >> 8) & 0xff;    // Last Wheel Event Time (MSB)
+      
+      // Crank Revolution Data (for cadence)
+      cscBuffer[7] = revolutions & 0xff;        // Cumulative Crank Revolutions (LSB)
+      cscBuffer[8] = (revolutions >> 8) & 0xff; // Cumulative Crank Revolutions (MSB)
+      cscBuffer[9] = timestamp & 0xff;          // Last Crank Event Time (LSB)
+      cscBuffer[10] = (timestamp >> 8) & 0xff;  // Last Crank Event Time (MSB)
+      
+      CSCMeasurement->setValue(cscBuffer, 11);
       CSCMeasurement->notify();
       
       lastNotify = millis();
       
-      Serial.printf("Sent - Power: %dW (corrected), Cadence: %dRPM, Revolutions: %d, Timestamp: %d\n", 
-                    powerInstantaneous, cadenceInstantaneous, revolutions, timestamp);
+      Serial.printf("Sent - Power: %dW, Cadence: %dRPM, Speed: %.1fkm/h, Distance: %.2fm\n", 
+                    powerInstantaneous, cadenceInstantaneous, estimatedSpeed, totalDistance);
     }
   }
   if (pServer->getConnectedCount() == 0)
