@@ -7,12 +7,26 @@ Data tested against Edge and Phone
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
+#define LED_PIN 22  // GPIO 22 for LoLin32 LED
+
 short powerInstantaneous = 0;
 short cadenceInstantaneous = 0;
 short speedInstantaneous = 0;
 float powerScale = 1.28; // incoming power is multiplied by this value for correction
 short resistance = 0; //Not currently doing anything with this value after receiving it
 bool notify = false;
+
+// LED status variables
+enum LEDState {
+  LED_CONNECTING_YESOUL,     // Fast blink - connecting to Yesoul
+  LED_YESOUL_CONNECTED,      // Double blink - Yesoul connected
+  LED_WAITING_CLIENT,        // Slow blink - waiting for iPhone/Apple Watch
+  LED_CLIENT_CONNECTED       // Solid on - iPhone/Apple Watch connected
+};
+LEDState currentLEDState = LED_CONNECTING_YESOUL;
+unsigned long lastLEDBlink = 0;
+int blinkCount = 0;
+bool ledState = false;
 
 // Define stuff for the Client that will receive data from Fitness Machine
 // The remote service we wish to connect to.
@@ -22,7 +36,7 @@ static BLEUUID charUUID("2ad2"); // Indoor Bike (Fitness Machine)
 
 static boolean doConnect = false;
 static boolean connected = false;
-static boolean doScan = false;
+static boolean doScan = true;  // Start with scan enabled
 static BLERemoteCharacteristic *pRemoteCharacteristic;
 static BLEAdvertisedDevice *myDevice;
 /* 
@@ -37,6 +51,7 @@ class ServerCallbacks : public NimBLEServerCallbacks
   {
     Serial.println("Client connected");
     Serial.println("Multi-connect support: start advertising");
+    currentLEDState = LED_CLIENT_CONNECTED;  // Switch to solid LED
     NimBLEDevice::startAdvertising();
   };
   /** Alternative onConnect() method to extract details of the connection. 
@@ -58,6 +73,7 @@ class ServerCallbacks : public NimBLEServerCallbacks
   void onDisconnect(NimBLEServer *pServer)
   {
     Serial.println("Client disconnected - start advertising");
+    currentLEDState = LED_WAITING_CLIENT;  // Back to slow blink
     NimBLEDevice::startAdvertising();
   };
   void onMTUChange(uint16_t MTU, ble_gap_conn_desc *desc)
@@ -177,7 +193,9 @@ class MyClientCallback : public BLEClientCallbacks
   void onDisconnect(BLEClient *pclient)
   {
     connected = false;
-    Serial.println("onDisconnect");
+    doScan = true;  // Restart scanning when Yesoul disconnects
+    currentLEDState = LED_CONNECTING_YESOUL;  // Back to fast blink
+    Serial.println("onDisconnect - Yesoul disconnected, restarting scan");
   }
 };
 
@@ -185,6 +203,8 @@ bool connectToServer()
 {
   Serial.print("Forming a connection to ");
   Serial.println(myDevice->getAddress().toString().c_str());
+  
+  currentLEDState = LED_CONNECTING_YESOUL;  // Fast blink during connection
 
   BLEClient *pClient = BLEDevice::createClient();
   Serial.println(" - Created client");
@@ -229,6 +249,8 @@ bool connectToServer()
     pRemoteCharacteristic->registerForNotify(notifyCallback);
 
   connected = true;
+  currentLEDState = LED_YESOUL_CONNECTED;  // Double blink - connection successful
+  blinkCount = 0;
   return true;
 }
 
@@ -277,6 +299,58 @@ void softDelay(unsigned long delayTime)
   }
 }
 
+// LED control function
+void updateLED() {
+  unsigned long currentTime = millis();
+  
+  switch (currentLEDState) {
+    case LED_CONNECTING_YESOUL:
+      // Fast blink - 200ms interval
+      if (currentTime - lastLEDBlink >= 200) {
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+        lastLEDBlink = currentTime;
+      }
+      break;
+      
+    case LED_YESOUL_CONNECTED:
+      // Double blink - slow pattern with pause
+      if (blinkCount < 4) {
+        // Blink pattern: ON-OFF-ON-OFF (4 state changes)
+        if (currentTime - lastLEDBlink >= 200) {
+          ledState = !ledState;
+          digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+          blinkCount++;
+          lastLEDBlink = currentTime;
+        }
+      } else if (blinkCount == 4) {
+        // Pause after double blink
+        if (currentTime - lastLEDBlink >= 500) {
+          digitalWrite(LED_PIN, LOW);
+          currentLEDState = LED_WAITING_CLIENT;
+          blinkCount = 0;
+          ledState = false;
+          lastLEDBlink = currentTime;
+        }
+      }
+      break;
+      
+    case LED_WAITING_CLIENT:
+      // Slow blink - 1000ms interval
+      if (currentTime - lastLEDBlink >= 1000) {
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+        lastLEDBlink = currentTime;
+      }
+      break;
+      
+    case LED_CLIENT_CONNECTED:
+      // Solid on
+      digitalWrite(LED_PIN, HIGH);
+      break;
+  }
+}
+
 /** Define callback instances globally to use for multiple Charateristics \ Descriptors */
 // This section is for the Server that will broadcast the data as Cycling Power
 static DescriptorCallbacks dscCallbacks;
@@ -315,11 +389,22 @@ void setup()
 {
   Serial.begin(115200);
   Serial.println("Starting NimBLE Server");
+  
+  // Initialize LED pin
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  currentLEDState = LED_CONNECTING_YESOUL;
 
   /** sets device name */
   NimBLEDevice::init("Yesoul_CP");
   /** Optional: set the transmit power, default is 3db */
   NimBLEDevice::setPower(ESP_PWR_LVL_P9); /** +9db */
+  
+  // Print Bluetooth MAC Address for NFC tag
+  Serial.println("========================================");
+  Serial.print("Bluetooth MAC Address: ");
+  Serial.println(NimBLEDevice::getAddress().toString().c_str());
+  Serial.println("========================================");
 
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
@@ -387,17 +472,20 @@ void setup()
 
   // Retrieve a Scanner and set the callback we want to use to be informed when we
   // have detected a new device.  Specify that we want active scanning and start the
-  // scan to run for 5 seconds.
+  // scan to run continuously until device is found.
   BLEScan *pBLEScan = BLEDevice::getScan();
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
   pBLEScan->setInterval(1349);
   pBLEScan->setWindow(449);
   pBLEScan->setActiveScan(true);
-  pBLEScan->start(5, false);
+  pBLEScan->start(0, false);  // 0 = continuous scanning
 }
 
 void loop()
 {
+  // Update LED status
+  updateLED();
+  
   // If the flag "doConnect" is true then we have scanned for and found the desired
   // BLE Server with which we wish to connect.  Now we connect to it.  Once we are
   // connected we set the connected flag to be true.
@@ -406,10 +494,12 @@ void loop()
     if (connectToServer())
     {
       Serial.println("We are now connected to the BLE Server.");
+      doScan = false;  // Stop scanning when connected
     }
     else
     {
-      Serial.println("We have failed to connect to the server; there is nothin more we will do.");
+      Serial.println("We have failed to connect to the server; restarting scan...");
+      doScan = true;  // Restart scan on connection failure
     }
     doConnect = false;
   }
@@ -421,7 +511,11 @@ void loop()
   }
   else if (doScan)
   {
-    BLEDevice::getScan()->start(0); // this is just sample to start scan after disconnect, most likely there is better way to do it in arduino
+    // Restart scan if not currently scanning
+    if (!BLEDevice::getScan()->isScanning()) {
+      Serial.println("Restarting scan for Yesoul device...");
+      BLEDevice::getScan()->start(0, false);  // Continuous scan
+    }
   }
 
   // convert RPM to timestamp
