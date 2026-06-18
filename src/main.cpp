@@ -420,8 +420,8 @@ unsigned short revolutions = 0;
 unsigned short timestamp = 0;
 unsigned short flags = 0x20; // Crank revolution data present flag
 byte sensorlocation = 0x0D;
-long lastNotify = 0;
-long lastRevolution = 0;
+unsigned long lastNotify = 0;
+unsigned long lastRevolution = 0;
 
 // Distance tracking variables
 unsigned long wheelRevolutions = 0;
@@ -696,7 +696,7 @@ void loop()
     }
   }
 
-  if (millis() - lastNotify >= 1000) // do this every second
+  if (millis() - lastNotify >= 500) // notify every 500ms for lower latency
   {
     if (pServer->getConnectedCount() > 0)
     {
