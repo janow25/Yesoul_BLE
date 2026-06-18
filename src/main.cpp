@@ -7,14 +7,22 @@ Data tested against Edge and Phone
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
-#define LED_PIN 22  // GPIO 22 for LoLin32 LED
+#ifndef LED_PIN
+#define LED_PIN 22  // GPIO 22 for LoLin32 LED (can be overridden by build flags)
+#endif
 
 short powerInstantaneous = 0;
 short cadenceInstantaneous = 0;
 short speedInstantaneous = 0;
 float powerScale = 1.28; // incoming power is multiplied by this value for correction
-short resistance = 0; //Not currently doing anything with this value after receiving it
+short resistance = 0; // Used for virtual gear ratio
+unsigned long lastYesoulDataTime = 0;
+const unsigned long YESOUL_DATA_TIMEOUT = 3000; // 3 seconds timeout for stale data
 bool notify = false;
+
+// Distance and speed tracking
+float estimatedSpeed = 0.0; // km/h
+float totalDistance = 0.0; // in meters
 
 // LED status variables
 enum LEDState {
@@ -39,6 +47,17 @@ static boolean connected = false;
 static boolean doScan = true;  // Start with scan enabled
 static BLERemoteCharacteristic *pRemoteCharacteristic;
 static BLEAdvertisedDevice *myDevice;
+
+// Reconnection logic - exponential backoff with retry limits
+const unsigned short MAX_RECONNECT_RETRIES = 10;     // Maximum retry attempts
+const unsigned long INITIAL_BACKOFF_MS = 1000;       // 1 second initial backoff
+const unsigned long MAX_BACKOFF_MS = 60000;          // 60 seconds maximum backoff
+const float BACKOFF_MULTIPLIER = 1.5;                // Exponential backoff multiplier
+unsigned short reconnectRetryCount = 0;              // Current retry attempt
+unsigned long lastReconnectAttempt = 0;              // Timestamp of last reconnect attempt
+unsigned long currentBackoffMs = INITIAL_BACKOFF_MS; // Current backoff duration
+bool maxRetriesReached = false;                      // Flag when max retries exceeded
+
 /* 
  * Server Stuff
  */
@@ -179,7 +198,8 @@ static void notifyCallback(
   // powerInstantaneous = powerInstantaneous * powerScale;  //power value correction
   cadenceInstantaneous = (pData[4] | pData[5] << 8) / 2; // 2 bytes of power in 0.5 resolution RPM, convert to RPM
   resistance = pData[9];                                 // 1 byte of resistance
-  Serial.printf("Power = %d | Cadence = %d | Resistance = %d\n", powerInstantaneous, cadenceInstantaneous, resistance);
+  lastYesoulDataTime = millis();                         // Track for stale data timeout
+  Serial.printf("Power = %d | Cadence = %d | Resistance = %d | Speed = %.1f km/h | Distance = %.2f m\n", powerInstantaneous, cadenceInstantaneous, resistance, estimatedSpeed, totalDistance);
 }
 
 /**  None of these are required as they will be handled by the library with defaults. **
@@ -193,9 +213,28 @@ class MyClientCallback : public BLEClientCallbacks
   void onDisconnect(BLEClient *pclient)
   {
     connected = false;
-    doScan = true;  // Restart scanning when Yesoul disconnects
     currentLEDState = LED_CONNECTING_YESOUL;  // Back to fast blink
-    Serial.println("onDisconnect - Yesoul disconnected, restarting scan");
+    
+    // Implement exponential backoff on disconnect
+    if (maxRetriesReached) {
+      Serial.println("onDisconnect - Max retries reached. Manual reset required.");
+      doScan = false;
+      return;
+    }
+    
+    reconnectRetryCount++;
+    lastReconnectAttempt = millis();
+    
+    // Calculate next backoff: cap at MAX_BACKOFF_MS
+    currentBackoffMs = (unsigned long)(INITIAL_BACKOFF_MS * pow(BACKOFF_MULTIPLIER, reconnectRetryCount - 1));
+    if (currentBackoffMs > MAX_BACKOFF_MS) {
+      currentBackoffMs = MAX_BACKOFF_MS;
+    }
+    
+    Serial.printf("onDisconnect - Yesoul disconnected. Retry %u/%u, backoff: %lums\n", 
+                  reconnectRetryCount, MAX_RECONNECT_RETRIES, currentBackoffMs);
+    
+    doScan = false;  // Don't scan yet, wait for backoff
   }
 };
 
@@ -380,10 +419,36 @@ long lastRevolution = 0;
 // Distance tracking variables
 unsigned long wheelRevolutions = 0;
 unsigned short wheelTimestamp = 0;
-float totalDistance = 0.0; // in meters
 float wheelCircumference = 2.096; // Standard road bike wheel circumference in meters (700x25c)
 long lastWheelRevolution = 0;
-float estimatedSpeed = 0.0; // km/h
+
+// Function to reset reconnection state (can be called after max retries)
+void resetReconnectionState() {
+  reconnectRetryCount = 0;
+  currentBackoffMs = INITIAL_BACKOFF_MS;
+  maxRetriesReached = false;
+  doScan = true;
+  lastReconnectAttempt = 0;
+  Serial.println("\n*** Reconnection state reset. Restarting scan...\n");
+}
+
+// Techno Gym calibrated speed curve based on power
+// Calibration points: 90W→21.6km/h, 105W→25.2km/h, 170W→28.8km/h
+float getPowerBasedSpeed(short power) {
+  if (power <= 90) {
+    // Below 90W - linear extrapolation from origin
+    return 21.6 * (power / 90.0);
+  } else if (power <= 105) {
+    // Interpolate between 90W (21.6 km/h) and 105W (25.2 km/h)
+    return 21.6 + (power - 90) * (25.2 - 21.6) / (105.0 - 90.0);
+  } else if (power <= 170) {
+    // Interpolate between 105W (25.2 km/h) and 170W (28.8 km/h)
+    return 25.2 + (power - 105) * (28.8 - 25.2) / (170.0 - 105.0);
+  } else {
+    // Above 170W - continue the trend
+    return 28.8 + (power - 170) * (28.8 - 25.2) / (170.0 - 105.0);
+  }
+}
 
 void setup()
 {
@@ -475,8 +540,10 @@ void setup()
   // scan to run continuously until device is found.
   BLEScan *pBLEScan = BLEDevice::getScan();
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setInterval(1349);
-  pBLEScan->setWindow(449);
+  // Optimized scan parameters for responsiveness (power not a concern)
+  // Shorter intervals = faster device discovery and reconnection
+  pBLEScan->setInterval(500);   // Reduced from 1349 (500ms scan interval)
+  pBLEScan->setWindow(250);     // Reduced from 449 (250ms scan window)
   pBLEScan->setActiveScan(true);
   pBLEScan->start(0, false);  // 0 = continuous scanning
 }
@@ -486,6 +553,60 @@ void loop()
   // Update LED status
   updateLED();
   
+  // Handle serial commands
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    command.toLowerCase();
+    
+    if (command == "reset") {
+      resetReconnectionState();
+    } else if (command == "status") {
+      Serial.println("\n=== Connection Status ===");
+      Serial.printf("Connected to Yesoul: %s\n", connected ? "YES" : "NO");
+      Serial.printf("Max retries reached: %s\n", maxRetriesReached ? "YES" : "NO");
+      Serial.printf("Retry count: %u/%u\n", reconnectRetryCount, MAX_RECONNECT_RETRIES);
+      if (!connected && !maxRetriesReached && reconnectRetryCount > 0) {
+        unsigned long elapsed = millis() - lastReconnectAttempt;
+        Serial.printf("Next retry in: %lu ms\n", (elapsed < currentBackoffMs) ? (currentBackoffMs - elapsed) : 0);
+      }
+      Serial.println("=========================\n");
+    } else if (command == "help") {
+      Serial.println("\n=== Available Commands ===");
+      Serial.println("  reset   - Reset reconnection state and restart scan");
+      Serial.println("  status  - Show connection status");
+      Serial.println("  help    - Show this help message");
+      Serial.println("===========================\n");
+    }
+  }
+  
+  // Stale data timeout (zero out values if no recent packets)
+  if (millis() - lastYesoulDataTime > YESOUL_DATA_TIMEOUT) {
+    powerInstantaneous = 0;
+    cadenceInstantaneous = 0;
+  }
+
+  // Handle exponential backoff before retrying
+  if (!doScan && !connected && !maxRetriesReached) {
+    unsigned long timeSinceDisconnect = millis() - lastReconnectAttempt;
+    if (timeSinceDisconnect >= currentBackoffMs) {
+      doScan = true;  // Proceed with scan after backoff period
+      Serial.printf("Backoff complete. Attempting reconnect (try %u/%u)...\n", 
+                    reconnectRetryCount, MAX_RECONNECT_RETRIES);
+    }
+  }
+  
+  // Check if max retries exceeded
+  if (reconnectRetryCount >= MAX_RECONNECT_RETRIES && !connected) {
+    if (!maxRetriesReached) {
+      maxRetriesReached = true;
+      doScan = false;
+      Serial.println("\n*** MAX RECONNECTION RETRIES REACHED ***");
+      Serial.println("Manual reset (power cycle) required to restart connection attempts.");
+      currentLEDState = LED_CONNECTING_YESOUL;  // LED will blink to indicate error state
+    }
+  }
+  
   // If the flag "doConnect" is true then we have scanned for and found the desired
   // BLE Server with which we wish to connect.  Now we connect to it.  Once we are
   // connected we set the connected flag to be true.
@@ -494,12 +615,30 @@ void loop()
     if (connectToServer())
     {
       Serial.println("We are now connected to the BLE Server.");
+      // Reset reconnection counters on successful connection
+      reconnectRetryCount = 0;
+      currentBackoffMs = INITIAL_BACKOFF_MS;
+      maxRetriesReached = false;
       doScan = false;  // Stop scanning when connected
     }
     else
     {
-      Serial.println("We have failed to connect to the server; restarting scan...");
-      doScan = true;  // Restart scan on connection failure
+      Serial.println("Connection attempt failed; waiting for backoff...");
+      doScan = false;  // Don't scan yet, let backoff timer handle it
+      reconnectRetryCount++;
+      
+      if (reconnectRetryCount >= MAX_RECONNECT_RETRIES) {
+        maxRetriesReached = true;
+        Serial.println("\n*** MAX RECONNECTION RETRIES REACHED ***");
+        Serial.println("Manual reset (power cycle) required to restart connection attempts.");
+      } else {
+        lastReconnectAttempt = millis();
+        currentBackoffMs = (unsigned long)(INITIAL_BACKOFF_MS * pow(BACKOFF_MULTIPLIER, reconnectRetryCount - 1));
+        if (currentBackoffMs > MAX_BACKOFF_MS) {
+          currentBackoffMs = MAX_BACKOFF_MS;
+        }
+        Serial.printf("Next retry in %lums (attempt %u/%u)\n", currentBackoffMs, reconnectRetryCount, MAX_RECONNECT_RETRIES);
+      }
     }
     doConnect = false;
   }
@@ -509,12 +648,12 @@ void loop()
   {
     //Stuff to do when connected to Client
   }
-  else if (doScan)
+  else if (doScan && !maxRetriesReached)
   {
     // Restart scan if not currently scanning
     if (!BLEDevice::getScan()->isScanning()) {
       Serial.println("Restarting scan for Yesoul device...");
-      BLEDevice::getScan()->start(0, false);  // Continuous scan
+      BLEDevice::getScan()->start(0, false);  // Continuous scan with faster intervals
     }
   }
 
@@ -525,16 +664,16 @@ void loop()
     timestamp = (unsigned short)(((millis() * 1024) / 1000) % 65536); // create timestamp and format
     lastRevolution = millis();
   }
-
-  // Calculate distance from cadence (indoor cycling estimation)
-  // Estimate speed based on cadence and typical gear ratio for indoor cycling
+  // Calculate speed from power using Techno Gym calibration curve
+  if (powerInstantaneous > 0) {
+    estimatedSpeed = getPowerBasedSpeed(powerInstantaneous);
+  } else {
+    estimatedSpeed = 0;
+  }
+  
   if (cadenceInstantaneous > 0) {
-    // Rough estimation: cadence * gear ratio factor * wheel circumference
-    // For indoor cycling, we'll use a moderate gear ratio equivalent
-    float gearRatio = 2.5; // Typical indoor cycling gear ratio
-    estimatedSpeed = (cadenceInstantaneous * gearRatio * wheelCircumference * 60) / 1000; // km/h
     
-    // Calculate wheel revolutions based on estimated speed
+    // Calculate wheel revolutions based on realistic speed from power
     unsigned long currentTime = millis();
     if (currentTime >= (lastWheelRevolution + 100)) { // Update every 100ms when moving
       float revolutionsPerSecond = (estimatedSpeed * 1000) / (wheelCircumference * 3600); // rev/sec
