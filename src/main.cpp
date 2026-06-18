@@ -11,6 +11,13 @@ Data tested against Edge and Phone
 #define LED_PIN 22  // GPIO 22 for LoLin32 LED (can be overridden by build flags)
 #endif
 
+#ifndef LED_ACTIVE_LOW
+#define LED_ACTIVE_LOW 0
+#endif
+
+#define LED_ON  (LED_ACTIVE_LOW ? LOW : HIGH)
+#define LED_OFF (LED_ACTIVE_LOW ? HIGH : LOW)
+
 short powerInstantaneous = 0;
 short cadenceInstantaneous = 0;
 short speedInstantaneous = 0;
@@ -347,7 +354,7 @@ void updateLED() {
       // Fast blink - 200ms interval
       if (currentTime - lastLEDBlink >= 200) {
         ledState = !ledState;
-        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+        digitalWrite(LED_PIN, ledState ? LED_ON : LED_OFF);
         lastLEDBlink = currentTime;
       }
       break;
@@ -358,14 +365,14 @@ void updateLED() {
         // Blink pattern: ON-OFF-ON-OFF (4 state changes)
         if (currentTime - lastLEDBlink >= 200) {
           ledState = !ledState;
-          digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+          digitalWrite(LED_PIN, ledState ? LED_ON : LED_OFF);
           blinkCount++;
           lastLEDBlink = currentTime;
         }
       } else if (blinkCount == 4) {
         // Pause after double blink
         if (currentTime - lastLEDBlink >= 500) {
-          digitalWrite(LED_PIN, LOW);
+          digitalWrite(LED_PIN, LED_OFF);
           currentLEDState = LED_WAITING_CLIENT;
           blinkCount = 0;
           ledState = false;
@@ -378,14 +385,14 @@ void updateLED() {
       // Slow blink - 1000ms interval
       if (currentTime - lastLEDBlink >= 1000) {
         ledState = !ledState;
-        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+        digitalWrite(LED_PIN, ledState ? LED_ON : LED_OFF);
         lastLEDBlink = currentTime;
       }
       break;
       
     case LED_CLIENT_CONNECTED:
       // Solid on
-      digitalWrite(LED_PIN, HIGH);
+      digitalWrite(LED_PIN, LED_ON);
       break;
   }
 }
@@ -457,7 +464,7 @@ void setup()
   
   // Initialize LED pin
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  digitalWrite(LED_PIN, LED_OFF);
   currentLEDState = LED_CONNECTING_YESOUL;
 
   /** sets device name */
